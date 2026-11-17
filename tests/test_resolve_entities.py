@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
+import httpx
 import pytest
 from pydantic import JsonValue, TypeAdapter
 
@@ -20,6 +21,7 @@ from soundcheck.ingest.lastfm.models import LastfmArtistSnapshot
 from soundcheck.ingest.lastfm.storage import LastfmSnapshotWriter
 from soundcheck.resolve.entities import (
     LastfmArtistCandidate,
+    MusicBrainzLookupUnavailable,
     PostArtistLink,
     RawResolutionPost,
     ResolutionAttempt,
@@ -290,6 +292,66 @@ async def test_unknown_lastfm_artist_link_does_not_abort_resolution() -> None:
             ErroringLastfmClient(10),
             resolved_at=_NOW,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outages", [1, 3])
+async def test_musicbrainz_outage_leaves_only_unfinished_posts_pending(
+    tmp_path: Path,
+    outages: int,
+) -> None:
+    class UnavailableForOneArtist(FakeMusicBrainzClient):
+        async def get(
+            self,
+            method: str,
+            params: Mapping[str, QueryValue],
+        ) -> dict[str, JsonValue]:
+            if "Crocodile Dundee" in str(params["query"]):
+                httpx.Response(
+                    503,
+                    request=httpx.Request("GET", "https://musicbrainz.org/ws/2/artist"),
+                ).raise_for_status()
+            return await super().get(method, params)
+
+    path = tmp_path / "resolution.duckdb"
+    writer = PostBatchWriter(path)
+    await writer.initialize()
+    # The middle posts each have a valid first match before their second lookup fails.
+    texts = ['"The Weeknd"', *['"The Weeknd" and "Crocodile Dundee"'] * outages, '"The Weeknd"']
+    for i, text in enumerate(texts):
+        await writer.add(
+            RawBlueskyPost(
+                uri=f"at://post/{i}",
+                did="did:plc:test",
+                text=text,
+                created_at=_NOW,
+                ingested_at=_NOW,
+                langs=(),
+                link_urls=(),
+                hashtags=(),
+                matched_rules=(),
+            )
+        )
+    await writer.flush()
+    store = DuckDBEntityResolutionStore(path)
+    lastfm = FakeLastfmClient()
+    resolution = resolve_entities(store, UnavailableForOneArtist(), lastfm, resolved_at=_NOW)
+    if outages == 1:
+        assert await resolution == (2, 0, 2)
+        pending = ["at://post/1"]
+    else:
+        with pytest.raises(MusicBrainzLookupUnavailable, match="503"):
+            await resolution
+        pending = [f"at://post/{i}" for i in range(1, len(texts))]
+
+    assert [post.uri for post in await store.load_pending_posts()] == pending
+    with duckdb.connect(str(path), read_only=True) as connection:
+        links = connection.execute(load_sql("select_stg_post_artist_links.sql")).fetchall()
+    assert {link[0] for link in links}.isdisjoint(pending)
+
+    recovered = FakeMusicBrainzClient()
+    assert await resolve_entities(store, recovered, lastfm) == (len(pending), 0, len(pending))
+    assert await store.load_pending_posts() == ()
 
 
 @pytest.mark.asyncio

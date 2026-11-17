@@ -7,9 +7,11 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from itertools import batched
 from typing import Protocol
 from urllib.parse import SplitResult, unquote_plus, urlsplit
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from rapidfuzz.fuzz import token_set_ratio
 from rapidfuzz.utils import default_process
@@ -17,7 +19,11 @@ from rapidfuzz.utils import default_process
 from soundcheck.ingest.http import QueryValue
 from soundcheck.ingest.lastfm.client import LastfmApiError
 from soundcheck.ingest.lastfm.models import ArtistGetInfoResponse
+from soundcheck.ingest.musicbrainz.client import MUSICBRAINZ_RETRYABLE_STATUS
 
+RESOLUTION_BATCH_SIZE = 100
+# Each exhausted lookup has already used the client's full retry/backoff budget.
+MAX_DEFERRED_POSTS_PER_RUN = 3
 MUSICBRAINZ_SCORE_THRESHOLD = 90.0
 MUSICBRAINZ_AMBIGUITY_MARGIN = 3.0
 LASTFM_SCORE_THRESHOLD = 92.0
@@ -42,6 +48,10 @@ _INTENT_NAME_PATTERNS = (
     re.compile(rf"(?i:\bnew\s+)(?P<name>{_CAPITALIZED_NAME})(?i:\s+album\b)"),
     re.compile(rf"(?P<name>{_CAPITALIZED_NAME})(?i:\s+just\s+dropped\b)"),
 )
+
+
+class MusicBrainzLookupUnavailable(RuntimeError):
+    """An artist lookup exhausted its retries and the post is still pending."""
 
 
 class ResolutionApiClient(Protocol):
@@ -263,40 +273,65 @@ async def resolve_entities(
     posts = await store.load_pending_posts()
     lastfm_artists = await store.load_lastfm_artists()
     resolution_time = resolved_at or datetime.now(UTC)
-    accepted: list[PostArtistLink] = []
-    ambiguities: list[PostArtistAmbiguity] = []
-    attempts: list[ResolutionAttempt] = []
+    total_links = total_ambiguities = total_attempts = 0
+    deferred = 0
+    for batch in batched(posts, RESOLUTION_BATCH_SIZE):
+        links: list[PostArtistLink] = []
+        ambiguities: list[PostArtistAmbiguity] = []
+        attempts: list[ResolutionAttempt] = []
+        try:
+            for post in batch:
+                try:
+                    post_links, post_ambiguities, candidate_count = await _resolve_post(
+                        post,
+                        musicbrainz_client,
+                        lastfm_client,
+                        lastfm_artists,
+                        resolution_time,
+                        logger,
+                    )
+                except MusicBrainzLookupUnavailable as exc:
+                    deferred += 1
+                    (logger or logging.getLogger(__name__)).warning(
+                        "Deferring post %s until the next run (%d/%d): %s",
+                        post.uri,
+                        deferred,
+                        MAX_DEFERRED_POSTS_PER_RUN,
+                        exc,
+                    )
+                    if deferred >= MAX_DEFERRED_POSTS_PER_RUN:
+                        raise
+                    continue
 
-    for post in posts:
-        post_links, post_ambiguities, candidate_count = await _resolve_post(
-            post,
-            musicbrainz_client,
-            lastfm_client,
-            lastfm_artists,
-            resolution_time,
-            logger,
-        )
-        accepted.extend(post_links)
-        ambiguities.extend(post_ambiguities)
-        outcome = "resolved" if post_links else "ambiguous" if post_ambiguities else "no_match"
-        if candidate_count == 0 and not post_links:
-            outcome = "no_candidate"
-        attempts.append(
-            ResolutionAttempt(
-                post_uri=post.uri,
-                outcome=outcome,
-                candidate_count=candidate_count,
-                attempted_at=resolution_time,
-            )
-        )
-
-    return await store.persist(
-        ResolutionBatch(
-            links=tuple(accepted),
-            ambiguities=tuple(ambiguities),
-            attempts=tuple(attempts),
-        )
-    )
+                if post_links:
+                    outcome = "resolved"
+                elif post_ambiguities:
+                    outcome = "ambiguous"
+                else:
+                    outcome = "no_match" if candidate_count else "no_candidate"
+                attempts.append(
+                    ResolutionAttempt(
+                        post_uri=post.uri,
+                        outcome=outcome,
+                        candidate_count=candidate_count,
+                        attempted_at=resolution_time,
+                    )
+                )
+                links.extend(post_links)
+                ambiguities.extend(post_ambiguities)
+        finally:
+            if attempts:
+                saved = await store.persist(
+                    ResolutionBatch(
+                        links=tuple(links),
+                        ambiguities=tuple(ambiguities),
+                        attempts=tuple(attempts),
+                    )
+                )
+                total_links += saved[0]
+                total_ambiguities += saved[1]
+                total_attempts += saved[2]
+    return total_links, total_ambiguities, total_attempts
 
 
 async def _resolve_post(
@@ -390,10 +425,17 @@ async def _resolve_with_musicbrainz(
     resolved_at: datetime,
 ) -> tuple[PostArtistLink | None, PostArtistAmbiguity | None]:
     escaped = candidate_name.replace("\\", "\\\\").replace('"', '\\"')
-    payload = await client.get(
-        "artist",
-        {"query": f'artist:"{escaped}"', "limit": 10, "offset": 0},
-    )
+    try:
+        payload = await client.get(
+            "artist",
+            {"query": f'artist:"{escaped}"', "limit": 10, "offset": 0},
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in MUSICBRAINZ_RETRYABLE_STATUS:
+            raise
+        raise MusicBrainzLookupUnavailable(str(exc)) from exc
+    except httpx.TransportError as exc:
+        raise MusicBrainzLookupUnavailable(str(exc)) from exc
     response = MusicBrainzArtistSearchResponse.model_validate(payload)
     scored = sorted(
         (

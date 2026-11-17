@@ -23,7 +23,7 @@ MUSICBRAINZ_USER_AGENT = "Soundcheck/0.1 ( contact-email )"
 MUSICBRAINZ_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 MUSICBRAINZ_MAX_RETRY_DELAY_SECONDS = 60.0
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
-_RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+MUSICBRAINZ_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
 def musicbrainz_user_agent(contact_email: str | None = None) -> str:
@@ -87,8 +87,6 @@ class MusicBrainzClient:
                     params=httpx.QueryParams(request_params),
                     headers={"User-Agent": self._user_agent},
                 )
-                if response.status_code in _RETRYABLE_HTTP_STATUS:
-                    response.raise_for_status()
                 response.raise_for_status()
                 payload = _JSON_OBJECT.validate_json(response.content)
             except (
@@ -96,8 +94,11 @@ class MusicBrainzClient:
                 httpx.HTTPStatusError,
                 # An empty or truncated 200 body is as transient as a timeout.
                 ValidationError,
-            ):
-                if attempt == self._max_attempts:
+            ) as exc:
+                if attempt == self._max_attempts or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code not in MUSICBRAINZ_RETRYABLE_STATUS
+                ):
                     raise
                 await self._sleeper(delay)
                 delay = min(delay * 2, MUSICBRAINZ_MAX_RETRY_DELAY_SECONDS)

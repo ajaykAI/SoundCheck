@@ -15,11 +15,22 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install duckdb==1.5.5
+      - run: python -m pip install duckdb==1.5.5 'pydantic>=2.9,<3'
       - name: Download failed checkpoint
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh run download 44909188573 --name soundcheck-duckdb-44909188573-1 --dir checkpoint
+      - name: Repair the failed checkpoint and verify preserved source data
+        run: |
+          python -u - <<'PY'
+          from pathlib import Path
+          from soundcheck.scripts.check_checkpoint import check_checkpoint
+          database = next(Path("checkpoint").rglob("*.duckdb"))
+          report = check_checkpoint(database, repair_resolution=True)
+          print(report.model_dump_json(), flush=True)
+          assert report.resolution_rebuilt
+          print(check_checkpoint(database).model_dump_json(), flush=True)
+          PY
       - name: Scan all stored columns and pending resolution query
         run: |
           python -u - <<'PY'
@@ -46,3 +57,10 @@ jobs:
                   except duckdb.Error as exc:
                       print("RESOLVER_ERROR", threads, str(exc), flush=True)
           PY
+      - name: Retain verified recovery for the pipeline
+        uses: actions/upload-artifact@v7
+        with:
+          name: soundcheck-recovered-checkpoint-44909188573
+          path: checkpoint/**/*.duckdb
+          retention-days: 90
+          compression-level: 0

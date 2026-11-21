@@ -9,7 +9,7 @@ description = "Evidence-first indie music trend intelligence"
 requires-python = ">=3.12"
 dependencies = [
   "atproto>=0.0.61,<1",
-  "duckdb>=1.1,<2",
+  "duckdb>=1.5.6,<2",
   "fastapi>=0.139,<1",
   "httpx>=0.27,<1",
   "lightgbm>=4.5,<5",

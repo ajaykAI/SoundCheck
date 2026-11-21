@@ -9,7 +9,7 @@ WORKDIR /app
 RUN addgroup --system soundcheck \
     && adduser --system --ingroup soundcheck soundcheck \
     && pip install --no-cache-dir \
-        "duckdb==1.5.5" \
+        "duckdb==1.5.6" \
         "fastapi==0.139.2" \
         "pydantic==2.13.4" \
         "uvicorn[standard]==0.51.0"

@@ -1,0 +1,48 @@
+name: Inspect failed pipeline checkpoint
+on:
+  push:
+    branches: [codex/fix-pipeline-checkpoint]
+    paths: [.github/workflows/checkpoint-diagnostic.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install duckdb==1.5.5
+      - name: Download failed checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 44909188573 --name soundcheck-duckdb-44909188573-1 --dir checkpoint
+      - name: Scan all stored columns and pending resolution query
+        run: |
+          python -u - <<'PY'
+          from pathlib import Path
+          import duckdb
+          database = next(Path("checkpoint").rglob("*.duckdb"))
+          sql = Path("soundcheck/sql")
+          with duckdb.connect(str(database), read_only=True) as connection:
+              tables = connection.execute((sql / "inspect_checkpoint_tables.sql").read_text()).fetchall()
+              for schema, table in tables:
+                  try:
+                      result = connection.execute((sql / "inspect_checkpoint_scan.sql").read_text(), [schema + "." + table]).fetchone()
+                      print("TABLE_OK", schema, table, "rows", result[0], flush=True)
+                  except duckdb.Error as exc:
+                      print("TABLE_ERROR", schema, table, str(exc), flush=True)
+          for threads in (4, 1):
+              with duckdb.connect(str(database), read_only=True, config={"threads": threads}) as connection:
+                  try:
+                      result = connection.execute((sql / "select_pending_resolution_posts.sql").read_text())
+                      count = 0
+                      while batch := result.fetchmany(10000):
+                          count += len(batch)
+                      print("RESOLVER_OK", threads, count, flush=True)
+                  except duckdb.Error as exc:
+                      print("RESOLVER_ERROR", threads, str(exc), flush=True)
+          PY

@@ -68,6 +68,13 @@ def test_recovery_keeps_raw_snapshots_and_original_backup(
     assert checkpoint._scan_table(database, "raw_.lastfm_artist_snapshots") == raw_before
     # Attempts are rebuilt together with links, so every post remains eligible.
     assert checkpoint._scan_table(database, "stg_.post_artist_resolution_attempts").rows == 0
+    monkeypatch.undo()
+    # A restored partial checkpoint must still force the downstream rebuild.
+    pending = checkpoint.check_checkpoint(database)
+    assert pending.downstream_rebuild_required
+    assert not pending.resolution_rebuilt
+    checkpoint.complete_recovery(database)
+    assert not checkpoint.check_checkpoint(database).downstream_rebuild_required
 
 
 @pytest.mark.parametrize("table", ["raw_.lastfm_artist_snapshots", "mart_.pipeline_runs"])

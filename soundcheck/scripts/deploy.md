@@ -166,10 +166,28 @@ version. Preserve the v1 API routes throughout.
 
 Collector checkpoints are deterministic by pinned collection date, phase, and
 shard. A rerun first restores the current workflow run's latest immutable
-artifact; otherwise it restores the latest successful run. The artifact
+artifact; otherwise it restores the latest checkpoint, including partial progress
+from a failed run. Before collection, every table is scanned through all its
+columns; a row count alone cannot detect damaged compressed segments. The artifact
 contains `data/soundcheck.duckdb` and, for weekly runs, the taxonomy comparison
 JSON. Raw snapshots remain append-only, v2 writes remain version-scoped, and
 stable MusicBrainz rows remain insert-on-first-sight.
+
+Known storage corruption limited to the three `stg_.post_artist_*` entity
+resolution tables is repaired on a copy. The tables are recreated together so
+all affected posts are retried. Every other table's row count and per-column
+hashes must remain identical before the repaired copy replaces the working
+database. The original is retained as a separate `soundcheck-damaged-checkpoint-`
+artifact, which cannot be selected by the normal restore filter. Recovery forces
+a weekly rebuild of downstream metrics, forecasts, and briefs; a durable marker
+keeps that requirement across failed attempts until the rebuild succeeds. Corruption in
+raw history or any other table stops the run without discarding data. A final
+full scan also gates successful publication. Changes to `weekly.yml` on `main`
+start a run immediately to verify workflow repairs.
+
+The batch, Docker API, and Vercel API use DuckDB 1.5.6 or newer on the 1.x line;
+the locked patch includes upstream checkpoint and index corruption fixes absent
+from 1.5.5. The original corruption trigger has not been reproduced independently.
 
 To roll back a cutover:
 

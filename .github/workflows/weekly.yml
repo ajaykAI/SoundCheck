@@ -1,6 +1,9 @@
 name: Soundcheck data pipeline
 
 on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/weekly.yml]
   schedule:
     - cron: "17 5 * * 0,2-6"
     - cron: "47 6 * * 1"
@@ -58,7 +61,7 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
 
-      - name: Restore the latest successful DuckDB artifact
+      - name: Restore the latest DuckDB checkpoint
         id: restore
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,6 +118,18 @@ jobs:
 
       - name: Install locked Python dependencies
         run: uv sync --locked
+
+      - name: Validate restored checkpoint and recover derived resolution state
+        id: checkpoint
+        if: hashFiles('data/soundcheck.duckdb') != ''
+        run: |
+          uv run python -m soundcheck.scripts.check_checkpoint \
+            --repair-resolution \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Rebuild all downstream products after checkpoint recovery
+        if: steps.checkpoint.outputs.downstream_rebuild_required == 'true'
+        run: echo "RUN_KIND=weekly" >> "$GITHUB_ENV"
 
       - name: Validate collector secrets
         run: |
@@ -288,9 +303,11 @@ jobs:
       - name: Finish successful pipeline manifest
         if: success()
         run: |
+          uv run python -m soundcheck.scripts.check_checkpoint
           uv run python -m soundcheck.scripts.pipeline_manifest finish \
             --run-id "$PIPELINE_RUN_ID" \
             --status success
+          uv run python -m soundcheck.scripts.check_checkpoint --complete-recovery
 
       - name: Compare taxonomy versions and enforce an explicit cutover
         id: taxonomy-comparison
@@ -344,6 +361,16 @@ jobs:
           path: |
             data/soundcheck.duckdb
             artifacts/taxonomy-v2-comparison.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Preserve the original damaged checkpoint for diagnosis
+        if: always() && hashFiles('data/soundcheck.duckdb.before-resolution-repair') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: soundcheck-damaged-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: data/soundcheck.duckdb.before-resolution-repair
           if-no-files-found: error
           retention-days: 90
           compression-level: 0

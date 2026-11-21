@@ -25,6 +25,7 @@ _CORRUPTION_MARKERS = (
     "failed to scan dictionary string",
     "invalid bitpacking mode",
 )
+_RECOVERY_TABLE = "stg_.checkpoint_recovery"
 
 
 class TableFingerprint(BaseModel):
@@ -44,6 +45,7 @@ class CheckpointReport(BaseModel):
     event: str = "checkpoint_checked"
     tables_checked: int = Field(ge=0)
     resolution_rebuilt: bool = False
+    downstream_rebuild_required: bool = False
     damaged_tables: tuple[str, ...] = ()
     backup_path: str | None = None
 
@@ -62,6 +64,21 @@ def _scan_table(database: Path, table: str) -> TableFingerprint:
     if row is None:
         raise RuntimeError(f"Checkpoint scan returned no result for {table}")
     return TableFingerprint(rows=row[0], column_hashes=tuple(row[1:]))
+
+
+def _recovery_pending(database: Path, tables: tuple[str, ...]) -> bool:
+    if _RECOVERY_TABLE not in tables:
+        return False
+    with duckdb.connect(str(database), read_only=True) as connection:
+        row = connection.execute(load_sql("select_checkpoint_recovery_pending.sql")).fetchone()
+    return row is not None and bool(row[0])
+
+
+def complete_recovery(database: Path) -> None:
+    """Clear the durable rebuild flag only after all downstream stages succeed."""
+    if _RECOVERY_TABLE in _table_names(database):
+        with duckdb.connect(str(database)) as connection:
+            connection.execute(load_sql("complete_checkpoint_recovery.sql"))
 
 
 def check_checkpoint(database: Path, *, repair_resolution: bool = False) -> CheckpointReport:
@@ -88,7 +105,10 @@ def check_checkpoint(database: Path, *, repair_resolution: bool = False) -> Chec
             damaged.append(table)
 
     if not damaged:
-        return CheckpointReport(tables_checked=len(tables))
+        return CheckpointReport(
+            tables_checked=len(tables),
+            downstream_rebuild_required=_recovery_pending(database, tables),
+        )
 
     backup = database.with_name(database.name + ".before-resolution-repair")
     if backup.exists():
@@ -113,13 +133,22 @@ def check_checkpoint(database: Path, *, repair_resolution: bool = False) -> Chec
             elif actual != fingerprints[table]:
                 raise RuntimeError(f"Recovery changed preserved data in {table}")
 
+        with duckdb.connect(str(candidate)) as connection:
+            connection.execute(load_sql("record_checkpoint_recovery.sql"))
+        # The durable marker makes retries rebuild downstream products even when
+        # they restore an already-repaired, partially resolved checkpoint.
+        verified = check_checkpoint(candidate)
+        if not verified.downstream_rebuild_required:
+            raise RuntimeError("Recovery did not retain its downstream rebuild flag")
+
         # Keep a recoverable original before replacing the working checkpoint.
         shutil.copy2(database, backup)
         candidate.replace(database)
 
     return CheckpointReport(
-        tables_checked=len(candidate_tables),
+        tables_checked=verified.tables_checked,
         resolution_rebuilt=True,
+        downstream_rebuild_required=True,
         damaged_tables=tuple(damaged),
         backup_path=str(backup),
     )
@@ -129,13 +158,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=Path("data/soundcheck.duckdb"))
     parser.add_argument("--repair-resolution", action="store_true")
+    parser.add_argument("--complete-recovery", action="store_true")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
+    if args.repair_resolution and args.complete_recovery:
+        parser.error("Repair and completion must be separate pipeline stages")
     report = check_checkpoint(args.database, repair_resolution=args.repair_resolution)
+    if args.complete_recovery:
+        complete_recovery(args.database)
     print(json.dumps(report.model_dump(mode="json"), sort_keys=True))
     if args.github_output is not None:
         with args.github_output.open("a", encoding="utf-8") as output:
             output.write(f"resolution_rebuilt={str(report.resolution_rebuilt).lower()}\n")
+            output.write(
+                f"downstream_rebuild_required={str(report.downstream_rebuild_required).lower()}\n"
+            )
 
 
 if __name__ == "__main__":
